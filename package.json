@@ -1,0 +1,41 @@
+{
+  "name": "ANKIT-interview-companion",
+  "version": "1.0.0",
+  "description": "Always-on-top real-time transparent AI interview overlay assistant.",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder"
+  },
+  "dependencies": {
+    "ws": "^8.14.2",
+    "@google/genai": "^1.2.0"
+  },
+  "devDependencies": {
+    "electron": "^28.1.0",
+    "electron-builder": "^24.9.1"
+  },
+  "build": {
+    "appId": "com.ANKIT.companion",
+    "productName": "ANKITAssistant",
+    "mac": {
+      "category": "public.app-category.education",
+      "target": [
+        "dmg",
+        "zip"
+      ]
+    },
+    "win": {
+      "target": "nsis"
+    },
+    "linux": {
+      "target": [
+        "deb",
+        "rpm",
+        "AppImage"
+      ],
+      "category": "Education"
+    }
+  }
+}
