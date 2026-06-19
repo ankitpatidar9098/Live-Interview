@@ -2,6 +2,19 @@ const { app, BrowserWindow, globalShortcut, ipcMain, screen, desktopCapturer, se
 const path = require('path');
 const { setupGeminiIpcHandlers } = require('./gemini-service');
 
+// ── Platform-specific GPU / rendering fixes ───────────────────────────────────
+if (process.platform === 'linux') {
+  // Forces X11 rendering so desktopCapturer works and Vulkan/PipeWire
+  // don't crash the GPU process with SIGSEGV.
+  process.env.ELECTRON_OZONE_PLATFORM_HINT = 'x11';
+  app.commandLine.appendSwitch('ozone-platform', 'x11');
+}
+app.commandLine.appendSwitch('disable-gpu');
+app.commandLine.appendSwitch('disable-gpu-sandbox');
+app.commandLine.appendSwitch('disable-software-rasterizer');
+app.commandLine.appendSwitch('no-sandbox');
+// ─────────────────────────────────────────────────────────────────────────────
+
 let overlayWindow = null;
 let isClickThrough = false;
 
@@ -31,8 +44,13 @@ function createOverlayWindow() {
 
   overlayWindow.loadFile('overlay.html');
 
-  // Set click-through behavior initially to false
-  overlayWindow.setIgnoreMouseEvents(false);
+  // Ensure click-through is OFF after page loads so buttons work immediately
+  overlayWindow.webContents.on('did-finish-load', () => {
+    overlayWindow.setIgnoreMouseEvents(false);
+    isClickThrough = false;
+    // Applied after render so window stays visible on screen but hidden from screenshots
+    overlayWindow.setContentProtection(true);
+  });
 
   // Magic Display Media handler for standard WebRTC getDisplayMedia to capture screen smoothly
   session.defaultSession.setDisplayMediaRequestHandler(
@@ -100,15 +118,21 @@ app.on('will-quit', () => {
 
 // IPC Bridge handlers for manual screen source selections if wanted
 ipcMain.handle('get-screen-sources', async () => {
-  const sources = await desktopCapturer.getSources({
-    types: ['window', 'screen'],
-    thumbnailSize: { width: 150, height: 150 }
-  });
-  return sources.map(source => ({
-    id: source.id,
-    name: source.name,
-    thumbnail: source.thumbnail.toDataURL()
-  }));
+  try {
+    const sources = await desktopCapturer.getSources({
+      types: ['screen'],
+      thumbnailSize: { width: 150, height: 150 }
+    });
+    return sources.map(source => ({
+      id: source.id,
+      name: source.name,
+      thumbnail: source.thumbnail.toDataURL()
+    }));
+  } catch (err) {
+    console.error('[DesktopCapturer] getSources failed:', err.message);
+    // Return empty array — renderer will fall back to mic-only mode gracefully
+    return [];
+  }
 });
 
 // Window Movement IPCs (Ctrl + Arrow Keys helper)

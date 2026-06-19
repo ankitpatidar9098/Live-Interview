@@ -19,6 +19,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   sendPCMAudioChunk: (base64PCM) => ipcRenderer.invoke('send-pcm-audio-chunk', base64PCM),
   sendImageToGeminiHttp: (args) => ipcRenderer.invoke('send-image-to-gemini-http', args),
   sendTextToGeminiHttp: (args) => ipcRenderer.invoke('send-text-to-gemini-http', args),
+  transcribeAudioChunk: (args) => ipcRenderer.invoke('transcribe-audio-chunk', args),
   closeStandaloneSession: () => ipcRenderer.invoke('close-standalone-session'),
   setCurrentSpeaker: (speaker) => ipcRenderer.send('set-current-speaker', speaker),
 
@@ -29,7 +30,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
       'update-response', 
       'update-status', 
       'global-shortcut-analyze-screen', 
-      'append-transcript-text'
+      'append-transcript-text',
+      'interim-transcript'
     ];
     if (validChannels.includes(channel)) {
       const listener = (event, ...args) => callback(...args);

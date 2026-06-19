@@ -1,4 +1,5 @@
 import AudioCaptureService from './audio-capture-service.js';
+import { SpeechRecognitionService } from './speech-recognition-service.js';
 
 const audioService = new AudioCaptureService();
 let socket = null;
@@ -119,7 +120,12 @@ function loadSettings() {
 
   const clickthrough = localStorage.getItem('pref_clickthrough') === 'true'; // default false
   clickthroughCheckbox.checked = clickthrough;
-  applyClickThrough(clickthrough);
+  // Always start with click-through OFF so buttons are clickable on boot
+  document.body.classList.remove('click-through');
+  // Defer the IPC call until after the window is fully ready
+  setTimeout(() => {
+    window.electronAPI.setClickThrough(false);
+  }, 500);
 
   customPromptTextarea.value = localStorage.getItem('pref_custom_prompt') || '';
 }
@@ -140,6 +146,12 @@ function applyOpacity(val) {
 }
 
 function applyClickThrough(val) {
+  // Always ensure body class is in sync with the value
+  if (val) {
+    document.body.classList.add('click-through');
+  } else {
+    document.body.classList.remove('click-through');
+  }
   window.electronAPI.setClickThrough(val);
 }
 
@@ -384,6 +396,11 @@ function connectWebSocketSync() {
     sessionResponses = [];
     currentResponseIndex = -1;
     renderActiveResponse();
+
+    // Always disable click-through when session opens so buttons are clickable
+    document.body.classList.remove('click-through');
+    window.electronAPI.setClickThrough(false);
+
     startSessionTimer();
   };
 
@@ -491,7 +508,7 @@ async function startStandaloneBYOKSession() {
   });
 
   if (initResult.success) {
-    statusText.innerText = "Live Session Connected";
+    statusText.innerText = "Listening...";
     activeIndicator.className = "status-dot active";
 
     setupPanel.style.display = 'none';
@@ -508,8 +525,13 @@ async function startStandaloneBYOKSession() {
     // Synchronize initial speaker state
     window.electronAPI.setCurrentSpeaker(currentSpeaker);
 
+    // ALWAYS disable click-through when session panel opens so buttons are clickable
+    document.body.classList.remove('click-through');
+    window.electronAPI.setClickThrough(false);
+
     startSessionTimer();
   } else {
+    isStandaloneMode = false;
     showToast(`Initialization failed: ${initResult.error || 'Check API Key validity'}`);
   }
 }
@@ -538,37 +560,76 @@ async function stopStandaloneSession() {
 startStandaloneBtn.addEventListener('click', startStandaloneBYOKSession);
 
 // =═══════════════════════════════════════════════
-//  STANDALONE VOICE PROCESSING (Float32 to Int16)
+//  STANDALONE VOICE PROCESSING
+//  MediaRecorder → Groq Whisper via main process native https
+//  Bypasses Chromium network service entirely.
 // =═══════════════════════════════════════════════
-function convertFloat32ToInt16(float32Array) {
-  const int16Array = new Int16Array(float32Array.length);
-  for (let i = 0; i < float32Array.length; i++) {
-    const s = Math.max(-1, Math.min(1, float32Array[i]));
-    int16Array[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+
+const SAMPLE_RATE   = 16000;
+const CHUNK_SAMPLES = 1600;
+
+let mediaRecorderInstance  = null;
+let mediaRecordingInterval = null;
+
+// Convert Uint8Array → single valid base64 string without stack overflow
+function uint8ToBase64(uint8) {
+  let binary = '';
+  const step = 8192;
+  for (let i = 0; i < uint8.length; i += step) {
+    binary += String.fromCharCode(...uint8.subarray(i, i + step));
   }
-  return int16Array;
+  return btoa(binary);  // single btoa call → single valid padded base64
 }
 
-function arrayBufferToBase64(buffer) {
-  let binary = '';
-  const bytes = new Uint8Array(buffer);
-  const len = bytes.byteLength;
-  for (let i = 0; i < len; i++) {
-    binary += String.fromCharCode(bytes[i]);
+async function sendAudioBlobToWhisper(blob) {
+  if (!isRecordingAudio || blob.size < 4000) return; // skip silence / tiny chunks
+
+  const currentGroqKey = groqKeyInput.value.trim() || localStorage.getItem('groq_api_key') || '';
+  const currentApiKey  = geminiKeyInput.value.trim() || localStorage.getItem('gemini_api_key') || '';
+  if (!currentGroqKey) return;
+
+  const arrayBuf = await blob.arrayBuffer();
+  const base64   = uint8ToBase64(new Uint8Array(arrayBuf));
+
+  console.log('[Recorder] Chunk', blob.size, 'bytes → Whisper');
+  statusText.innerText = 'Transcribing...';
+  try {
+    const result = await window.electronAPI.transcribeAudioChunk({
+      base64Audio: base64,
+      mimeType: blob.type || 'audio/webm',
+      groqKey: currentGroqKey,
+      apiKey: currentApiKey
+    });
+    if (result && result.text && result.text.trim().length > 2) {
+      statusText.innerText = 'Thinking...';
+      await window.electronAPI.sendTextToGeminiHttp({
+        apiKey: currentApiKey,
+        groqKey: currentGroqKey,
+        text: result.text
+      });
+    } else {
+      statusText.innerText = 'Listening...';
+    }
+  } catch (err) {
+    console.error('[Whisper] IPC error:', err.message);
+    statusText.innerText = 'Listening...';
   }
-  return btoa(binary);
+}
+
+function startNewRecording(micStream, mimeType) {
+  if (!isRecordingAudio) return;
+  const rec = new MediaRecorder(micStream, { mimeType });
+  rec.ondataavailable = (e) => {
+    if (e.data && e.data.size > 0) sendAudioBlobToWhisper(e.data);
+  };
+  rec.start();       // no timeslice — stop() will flush one complete webm file
+  mediaRecorderInstance = rec;
 }
 
 async function startStandaloneAudioProcessing() {
-  const SAMPLE_RATE = 24000;
-  const AUDIO_CHUNK_DURATION = 0.1; 
-  const BUFFER_SIZE = 4096;
-
   try {
-    // 1. Microphone track
     standaloneMicStream = await navigator.mediaDevices.getUserMedia({
       audio: {
-        sampleRate: SAMPLE_RATE,
         channelCount: 1,
         echoCancellation: true,
         noiseSuppression: true,
@@ -576,115 +637,65 @@ async function startStandaloneAudioProcessing() {
       }
     });
 
-    // 2. System Audio track from screen capturer loopback
-    let sourceId = null;
-    try {
-      const sources = await window.electronAPI.getScreenSources();
-      const screenSource = sources.find(s => s.id.startsWith('screen')) || sources[0];
-      if (screenSource) {
-        sourceId = screenSource.id;
-      }
-    } catch (e) {
-      console.warn("Screen capturer access restricted.", e);
+    const groqKey = groqKeyInput.value.trim() || localStorage.getItem('groq_api_key') || '';
+    if (!groqKey) {
+      showToast('Enter your Groq API key first — needed for Whisper transcription', 'rgba(239,68,68,0.95)');
     }
 
-    if (sourceId) {
-      try {
-        standaloneMediaStream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            mandatory: {
-              chromeMediaSource: 'desktop',
-              chromeMediaSourceId: sourceId
-            }
-          },
-          video: {
-            mandatory: {
-              chromeMediaSource: 'desktop',
-              chromeMediaSourceId: sourceId,
-              maxFrameRate: 1,
-              maxWidth: 1280,
-              maxHeight: 720
-            }
-          }
-        });
-      } catch (err) {
-        console.warn("No system loopback loop available. Capturing mic only.", err);
-      }
-    }
-
-    // Set up Web Audio API nodes
-    standaloneAudioContext = new AudioContext({ sampleRate: SAMPLE_RATE });
-    if (standaloneAudioContext.state === 'suspended') {
-      await standaloneAudioContext.resume();
-    }
-    
-    // Create a single processor for the mixed stream
-    standaloneMicProcessor = standaloneAudioContext.createScriptProcessor(BUFFER_SIZE, 1, 1);
-    
-    // Process Microphone channel
-    const micSource = standaloneAudioContext.createMediaStreamSource(standaloneMicStream);
-    const micGain = standaloneAudioContext.createGain();
-    micGain.gain.value = 1.0;
-    micSource.connect(micGain);
-    micGain.connect(standaloneMicProcessor);
-
-    // Process System audio channel if captured
-    if (standaloneMediaStream && standaloneMediaStream.getAudioTracks().length > 0) {
-      const sysSource = standaloneAudioContext.createMediaStreamSource(standaloneMediaStream);
-      const sysGain = standaloneAudioContext.createGain();
-      sysGain.gain.value = 1.5; // Boost interviewer's voice
-      sysSource.connect(sysGain);
-      sysGain.connect(standaloneMicProcessor);
-    }
-
-    standaloneMicProcessor.connect(standaloneAudioContext.destination);
-
-    let micBuffer = [];
-    const samplesPerChunk = SAMPLE_RATE * AUDIO_CHUNK_DURATION;
-
-    standaloneMicProcessor.onaudioprocess = async e => {
-      const inputData = e.inputBuffer.getChannelData(0);
-      micBuffer.push(...inputData);
-
-      while (micBuffer.length >= samplesPerChunk) {
-        const chunk = micBuffer.splice(0, samplesPerChunk);
-        const pcm16 = convertFloat32ToInt16(chunk);
-        const base64PCM = arrayBufferToBase64(pcm16.buffer);
-        
-        // Push raw PCM base64 data to main process
-        await window.electronAPI.sendPCMAudioChunk(base64PCM);
-      }
-    };
+    const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+      ? 'audio/webm;codecs=opus'
+      : 'audio/webm';
 
     isRecordingAudio = true;
-    startAudioBtn.innerText = "Capturing Direct...";
-    startAudioBtn.className = "btn audio-btn active-record";
-    activeIndicator.className = "status-dot live-recording";
-  } catch (error) {
-    console.error("Standalone Audio capturing error:", error);
-    showToast("Standalone Audio initialization failed. check audio permissions.");
+    startNewRecording(standaloneMicStream, mimeType);
+
+    // Every 5 s: stop current recorder (fires ondataavailable with complete webm),
+    // then start a fresh one. Each flush is an independently valid file for Whisper.
+    mediaRecordingInterval = setInterval(() => {
+      if (!isRecordingAudio) return;
+      const current = mediaRecorderInstance;
+      if (current && current.state === 'recording') {
+        current.stop();                          // triggers ondataavailable
+      }
+      setTimeout(() => startNewRecording(standaloneMicStream, mimeType), 150);
+    }, 5000);
+
+    startAudioBtn.innerText   = 'Listening (Whisper)...';
+    startAudioBtn.className   = 'btn audio-btn active-record';
+    activeIndicator.className = 'status-dot live-recording';
+    statusText.innerText      = 'Listening...';
+    console.log('[Audio] MediaRecorder started — Groq Whisper active');
+
+  } catch (err) {
+    console.error('[Audio] Init failed:', err);
+    showToast('Mic access failed: ' + err.message);
   }
 }
 
 function stopStandaloneAudioProcessing() {
   isRecordingAudio = false;
-  
-  if (standaloneMicProcessor) {
-    standaloneMicProcessor.disconnect();
-    standaloneMicProcessor = null;
+
+  if (mediaRecordingInterval) {
+    clearInterval(mediaRecordingInterval);
+    mediaRecordingInterval = null;
   }
-  if (standaloneAudioProcessor) {
-    standaloneAudioProcessor.disconnect();
-    standaloneAudioProcessor = null;
+  if (mediaRecorderInstance) {
+    try { mediaRecorderInstance.stop(); } catch (_) {}
+    mediaRecorderInstance = null;
+  }
+  if (standaloneMicStream) {
+    standaloneMicStream.getTracks().forEach(t => t.stop());
+    standaloneMicStream = null;
   }
   if (standaloneAudioContext) {
     standaloneAudioContext.close();
     standaloneAudioContext = null;
   }
 
-  startAudioBtn.innerText = "Start Capturing";
-  startAudioBtn.className = "btn audio-btn idle";
-  activeIndicator.className = "status-dot active";
+  startAudioBtn.innerText   = 'Start Capturing';
+  startAudioBtn.className   = 'btn audio-btn idle';
+  activeIndicator.className = 'status-dot active';
+  statusText.innerText      = 'Connected';
 }
 
 // =═══════════════════════════════════════════════
@@ -979,6 +990,116 @@ backToSetupBtn.addEventListener('click', async () => {
     stopSyncCapture();
   }
 
+  isStandaloneMode = false;
+
+  // Stop auto-listen if it was running
+  stopAutoListen();
+
+  // Force disable click-through when returning to setup panel
+  document.body.classList.remove('click-through');
+  window.electronAPI.setClickThrough(false);
+
   appOverlayPanel.style.display = 'none';
   setupPanel.style.display = 'flex';
+  activeIndicator.className = 'status-dot';
+  statusText.innerText = 'Disconnected';
+
+  // Reset speaker button
+  currentSpeaker = 'candidate';
+  toggleSpeakerBtn.innerText = 'Speaker: Candidate';
+  toggleSpeakerBtn.className = 'speaker-btn candidate';
 });
+
+// =═══════════════════════════════════════════════
+//  AUTO-LISTEN: SPEECH → PROMPT OVERRIDE INJECTION
+//  Hooks into the Gemini Live inputTranscription
+//  stream. When speaker = Interviewer, finalized
+//  sentences are auto-injected into the AI pipeline
+//  (dispatchToAI already handles this in gemini-
+//  service.js). This service drives the UI display.
+// =═══════════════════════════════════════════════
+
+const autoListenBtn      = document.getElementById('auto-listen-btn');
+const interimSpeechBar   = document.getElementById('interim-speech-bar');
+const interimSpeechText  = document.getElementById('interim-speech-text');
+
+const sttService = new SpeechRecognitionService();
+
+// ── Wire up STT callbacks ────────────────────────────────────────────────────
+
+sttService.onInterimTranscript = (text) => {
+  // Show live partial text so the user can see what's being heard in real-time
+  interimSpeechBar.style.display = 'block';
+  interimSpeechText.innerText    = '🎙 ' + text;
+};
+
+sttService.onFinalTranscript = (text) => {
+  // Clear interim display — the transcript bubble is already added by
+  // the 'append-transcript-text' IPC handler in gemini-service.js.
+  // The AI dispatch also already happened via dispatchToAI().
+  // We just clear the interim bar here.
+  interimSpeechText.innerText    = '';
+  interimSpeechBar.style.display = 'none';
+
+  console.log('[AutoListen] Interviewer said:', text);
+};
+
+sttService.onStatusChange = (status, msg) => {
+  switch (status) {
+    case 'listening':
+      autoListenBtn.innerText   = '🎙 Auto-Listen: ON';
+      autoListenBtn.className   = 'btn auto-listen-btn active';
+      statusText.innerText      = 'Auto-Listening...';
+      break;
+
+    case 'stopped':
+      autoListenBtn.innerText   = '🎙 Auto-Listen: OFF';
+      autoListenBtn.className   = 'btn auto-listen-btn idle';
+      interimSpeechBar.style.display = 'none';
+      interimSpeechText.innerText    = '';
+      if (appOverlayPanel.style.display === 'flex') {
+        statusText.innerText = 'Listening...';
+      }
+      break;
+
+    case 'error':
+      console.error('[STT] Error:', msg);
+      showToast('Auto-Listen error: ' + msg, 'rgba(239,68,68,0.95)');
+      autoListenBtn.innerText = '🎙 Auto-Listen: OFF';
+      autoListenBtn.className = 'btn auto-listen-btn idle';
+      break;
+  }
+};
+
+// ── Button toggle ────────────────────────────────────────────────────────────
+
+autoListenBtn.addEventListener('click', () => {
+  if (sttService.isRunning) {
+    stopAutoListen();
+  } else {
+    startAutoListen();
+  }
+});
+
+function startAutoListen() {
+  // Auto-Listen requires the Gemini Live session to be active (it uses its transcription)
+  if (!isStandaloneMode) {
+    showToast('Auto-Listen works in Standalone (BYOK) mode with an active session.', 'rgba(245,158,11,0.95)');
+    return;
+  }
+  // Switch speaker to interviewer so Gemini Live labels transcriptions correctly
+  // and dispatchToAI fires on turn complete
+  if (currentSpeaker !== 'interviewer') {
+    currentSpeaker = 'interviewer';
+    toggleSpeakerBtn.innerText  = 'Speaker: INTERVIEWER';
+    toggleSpeakerBtn.className  = 'speaker-btn interviewer';
+    window.electronAPI.setCurrentSpeaker('interviewer');
+  }
+
+  const lang = languageInput?.value || localStorage.getItem('selected_language') || 'en-US';
+  sttService.start(lang);
+}
+
+function stopAutoListen() {
+  sttService.stop();
+}

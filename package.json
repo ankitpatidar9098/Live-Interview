@@ -9,12 +9,12 @@
     "dist": "electron-builder"
   },
   "dependencies": {
-    "ws": "^8.14.2",
-    "@google/genai": "^1.2.0"
+    "@google/genai": "^1.2.0",
+    "ws": "^8.14.2"
   },
   "devDependencies": {
-    "electron": "^28.1.0",
-    "electron-builder": "^24.9.1"
+    "electron": "^41.7.1",
+    "electron-builder": "^26.8.1"
   },
   "build": {
     "appId": "com.ANKIT.companion",

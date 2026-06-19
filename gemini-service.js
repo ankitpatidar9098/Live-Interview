@@ -1,404 +1,367 @@
-const { GoogleGenAI, Modality } = require('@google/genai');
 const { ipcMain, BrowserWindow } = require('electron');
+const https = require('https');
 
-let activeSession = null;
+// ─── State ────────────────────────────────────────────────────────────────────
+let activeSession      = null;
 let currentTranscription = '';
-let conversationHistory = [];
-let currentSystemPrompt = '';
-let groqHistory = [];
-let isInitializing = false;
+let conversationHistory  = [];
+let currentSystemPrompt  = '';
+let groqHistory          = [];
+let isInitializing       = false;
+let currentSpeakerState  = 'candidate';   // toggled by renderer via IPC
 
-// Helper to broadcast streaming updates to the renderer window
+// gemini-3.1-flash-live-preview is the current Live API model (as of June 2026)
+// Replaces all gemini-2.0-flash-live-* and gemini-2.5-flash-native-audio-preview-* models
+const LIVE_MODEL   = 'gemini-3.1-flash-live-preview';
+const API_VERSION  = 'v1beta';   // SDK default
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 function sendToRenderer(channel, data) {
-  const windows = BrowserWindow.getAllWindows();
-  if (windows.length > 0) {
-    windows[0].webContents.send(channel, data);
-  }
+  const wins = BrowserWindow.getAllWindows();
+  if (wins.length > 0) wins[0].webContents.send(channel, data);
 }
 
-// Strip DeepSeek's <think> tags for clean display
 function stripThinkingTags(text) {
   return text.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
 }
 
-// Generate the customized system instruction based on profiles
-function getSystemPrompt(profile, customPrompt, webSearch) {
-  let basePrompt = `You are a real-time conversational AI interviewer assistant. Your goal is to provide brief, actionable hints and precise answers to help the candidate. 
-Keep your responses formatting clean, using bold text for key words. Do NOT use lengthy introductions. 
-Formatting guidelines:
-- If a coding question is asked: provide a brief 2-bullet conceptual approach, then write the optimized code inside a standard markdown code block. Include Time and Space complexities.
-- If a behavioral question is asked: format your response using a precise STAR method (Situation, Task, Action, Result) in structured bullet points.
-- If it is a general knowledge question: give a concise 2-sentence direct answer.
-`;
-  
+// ─── System Prompt ────────────────────────────────────────────────────────────
+function getSystemPrompt(profile, customPrompt) {
+  let base = `You are a real-time AI interview assistant. Provide brief, actionable hints and precise answers.
+Keep formatting clean with bold key words. No lengthy introductions.
+- Coding question  → 2-bullet approach + optimized code block + Time/Space complexity
+- Behavioral question → STAR method in structured bullet points
+- General question → 2-sentence direct answer`;
+
   if (profile === 'coding') {
-    basePrompt += `\nFocus heavily on data structures, algorithmic complexity, edge cases, and high-performance clean code. Always provide the best time-complexity solution.`;
+    base += '\nFocus on data structures, algorithmic complexity, edge cases, and clean high-performance code.';
   } else if (profile === 'hr') {
-    basePrompt += `\nFocus heavily on leadership principles, communication style, cultural alignment, and emotional intelligence. Always utilize the STAR method explicitly.`;
+    base += '\nFocus on leadership principles, communication, cultural alignment, and emotional intelligence. Always use STAR explicitly.';
   }
-  
+
   if (customPrompt && customPrompt.trim()) {
-    basePrompt += `\nAdditional user guidelines: ${customPrompt}`;
+    base += `\nAdditional instructions: ${customPrompt.trim()}`;
   }
-  
-  return basePrompt;
+  return base;
 }
 
-// Direct Call to Groq (DeepSeek-R1 Distilled / Llama 3.3) for fast responses
-async function sendToGroq(transcription, groqKey) {
-  if (!groqKey || !transcription || transcription.trim() === '') return;
+// ─── Native HTTPS POST (bypasses Chromium network service entirely) ─────────
+function nodeHttpsPost(hostname, path, extraHeaders, bodyObj) {
+  return new Promise((resolve, reject) => {
+    const bodyStr = JSON.stringify(bodyObj);
+    const req = https.request(
+      {
+        hostname,
+        path,
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(bodyStr),
+          ...extraHeaders
+        }
+      },
+      (res) => {
+        let data = '';
+        res.on('data', chunk => { data += chunk; });
+        res.on('end', () => {
+          try { resolve({ status: res.statusCode, body: JSON.parse(data) }); }
+          catch (e) { reject(new Error('JSON parse failed: ' + data.slice(0, 300))); }
+        });
+      }
+    );
+    req.on('error', reject);
+    req.write(bodyStr);
+    req.end();
+  });
+}
 
-  const modelToUse = 'llama-3.3-70b-versatile';
-  console.log(`[Groq] Sending transcription to ${modelToUse}...`);
+// ─── Groq Whisper — multipart/form-data transcription (native https) ────────
+function buildMultipartBody(boundary, fields, fileField, filename, mimeType, fileBuffer) {
+  const parts = [];
+  for (const [name, value] of Object.entries(fields)) {
+    parts.push(Buffer.from(
+      `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`
+    ));
+  }
+  const fileHeader = Buffer.from(
+    `--${boundary}\r\nContent-Disposition: form-data; name="${fileField}"; filename="${filename}"\r\nContent-Type: ${mimeType}\r\n\r\n`
+  );
+  const fileFooter = Buffer.from(`\r\n--${boundary}--\r\n`);
+  return Buffer.concat([...parts, fileHeader, fileBuffer, fileFooter]);
+}
+
+async function transcribeWithGroqWhisper(audioBuffer, groqKey) {
+  const boundary = 'WhisperBoundary' + Date.now() + Math.random().toString(36).slice(2);
+  const body = buildMultipartBody(
+    boundary,
+    { model: 'whisper-large-v3', language: 'en' },
+    'file', 'audio.webm', 'audio/webm',
+    audioBuffer
+  );
+
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      {
+        hostname: 'api.groq.com',
+        path: '/openai/v1/audio/transcriptions',
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${groqKey}`,
+          'Content-Type': `multipart/form-data; boundary=${boundary}`,
+          'Content-Length': body.length
+        }
+      },
+      (res) => {
+        let data = '';
+        res.on('data', chunk => { data += chunk; });
+        res.on('end', () => {
+          console.log('[Whisper] HTTP status:', res.statusCode);
+          try { resolve({ status: res.statusCode, body: JSON.parse(data) }); }
+          catch (e) { reject(new Error('Whisper parse failed: ' + data.slice(0, 300))); }
+        });
+      }
+    );
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+// ─── Groq (native https, non-streaming) ───────────────────────────────────────
+async function sendToGroq(transcription, groqKey) {
+  if (!groqKey || !transcription.trim()) return;
 
   groqHistory.push({ role: 'user', content: transcription.trim() });
-  if (groqHistory.length > 16) {
-    groqHistory = groqHistory.slice(-16);
-  }
+  if (groqHistory.length > 16) groqHistory = groqHistory.slice(-16);
 
+  console.log('[Groq] Sending via native https...');
   try {
-    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${groqKey}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        model: modelToUse,
+    const { status, body } = await nodeHttpsPost(
+      'api.groq.com',
+      '/openai/v1/chat/completions',
+      { 'Authorization': `Bearer ${groqKey}` },
+      {
+        model: 'llama-3.3-70b-versatile',
         messages: [
           { role: 'system', content: currentSystemPrompt || 'You are a helpful assistant.' },
           ...groqHistory
         ],
-        stream: true,
+        stream: false,
         temperature: 0.6,
         max_tokens: 1024
-      })
-    });
+      }
+    );
+    if (status !== 200) {
+      console.error('[Groq] API Error:', status);
+      sendToRenderer('update-status', `Groq Error: ${status}`);
+      return;
+    }
+    const fullText = body.choices?.[0]?.message?.content || '';
+    console.log('[Groq] Response length:', fullText.length);
+    const clean = stripThinkingTags(fullText);
+    if (clean) {
+      sendToRenderer('new-response', clean);
+      groqHistory.push({ role: 'assistant', content: clean });
+      conversationHistory.push({ timestamp: Date.now(), transcription: transcription.trim(), ai_response: clean });
+    }
+    sendToRenderer('update-status', 'Listening...');
+  } catch (err) {
+    console.error('[Groq] Error:', err.message);
+    sendToRenderer('update-status', 'Groq Error: ' + err.message);
+  }
+}
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error('[Groq] API Error:', response.status, errorText);
-      sendToRenderer('update-status', `Groq Error: ${response.status}`);
+// ─── Gemini Flash (native https, non-streaming) ───────────────────────────────
+async function sendToGeminiFlash(transcription, apiKey) {
+  if (!apiKey || !transcription.trim()) return;
+
+  console.log('[Gemini Flash] Sending via native https...');
+  try {
+    const history = conversationHistory.flatMap(t => [
+      { role: 'user',  parts: [{ text: t.transcription }] },
+      { role: 'model', parts: [{ text: t.ai_response   }] }
+    ]);
+    history.push({ role: 'user', parts: [{ text: transcription.trim() }] });
+
+    const { status, body } = await nodeHttpsPost(
+      'generativelanguage.googleapis.com',
+      `/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
+      {},
+      {
+        contents: history,
+        systemInstruction: { parts: [{ text: currentSystemPrompt }] }
+      }
+    );
+
+    if (status !== 200) {
+      console.error('[Gemini Flash] API Error:', status, JSON.stringify(body).slice(0, 300));
+      sendToRenderer('update-status', 'Gemini Error: ' + (body?.error?.message || status));
       return;
     }
 
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let fullText = '';
-    let isFirst = true;
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      const chunk = decoder.decode(value, { stream: true });
-      const lines = chunk.split('\n').filter(line => line.trim() !== '');
-
-      for (const line of lines) {
-        if (line.startsWith('data: ')) {
-          const data = line.slice(6);
-          if (data === '[DONE]') continue;
-
-          try {
-            const json = JSON.parse(data);
-            const token = json.choices?.[0]?.delta?.content || '';
-            if (token) {
-              fullText += token;
-              const displayText = stripThinkingTags(fullText);
-              if (displayText) {
-                sendToRenderer(isFirst ? 'new-response' : 'update-response', displayText);
-                isFirst = false;
-              }
-            }
-          } catch (parseError) {
-            // Ignore parse errors on incomplete chunk boundaries
-          }
-        }
-      }
-    }
-
-    const cleanedResponse = stripThinkingTags(fullText);
-    if (cleanedResponse) {
-      groqHistory.push({ role: 'assistant', content: cleanedResponse });
-      // Save turn
-      conversationHistory.push({
-        timestamp: Date.now(),
-        transcription: transcription.trim(),
-        ai_response: cleanedResponse
-      });
-    }
-
-    sendToRenderer('update-status', 'Listening...');
-  } catch (error) {
-    console.error('[Groq] Failed calling API:', error);
-    sendToRenderer('update-status', 'Groq Call Error: ' + error.message);
-  }
-}
-
-// Direct Call to Gemini Flash for standard standalone responses
-async function sendToGeminiFlash(transcription, apiKey) {
-  if (!apiKey || !transcription || transcription.trim() === '') return;
-
-  console.log('[Gemini] Sending transcription to gemini-2.5-flash...');
-
-  try {
-    const ai = new GoogleGenAI({ apiKey });
-    
-    const messages = conversationHistory.map(turn => [
-      { role: 'user', parts: [{ text: turn.transcription }] },
-      { role: 'model', parts: [{ text: turn.ai_response }] }
-    ]).flat();
-
-    messages.push({ role: 'user', parts: [{ text: transcription.trim() }] });
-
-    const responseStream = await ai.models.generateContentStream({
-      model: 'gemini-2.5-flash',
-      contents: messages,
-      config: {
-        systemInstruction: { parts: [{ text: currentSystemPrompt }] }
-      }
-    });
-
-    let fullText = '';
-    let isFirst = true;
-
-    for await (const chunk of responseStream) {
-      const chunkText = chunk.text;
-      if (chunkText) {
-        fullText += chunkText;
-        sendToRenderer(isFirst ? 'new-response' : 'update-response', fullText);
-        isFirst = false;
-      }
-    }
+    const fullText = (body.candidates?.[0]?.content?.parts || []).map(p => p.text || '').join('');
+    console.log('[Gemini Flash] Response length:', fullText.length);
 
     if (fullText.trim()) {
-      conversationHistory.push({
-        timestamp: Date.now(),
-        transcription: transcription.trim(),
-        ai_response: fullText.trim()
-      });
+      sendToRenderer('new-response', fullText.trim());
+      conversationHistory.push({ timestamp: Date.now(), transcription: transcription.trim(), ai_response: fullText.trim() });
+    } else {
+      console.warn('[Gemini Flash] Empty response from API');
     }
-
     sendToRenderer('update-status', 'Listening...');
-  } catch (error) {
-    console.error('[Gemini] Standalone generation error:', error);
-    sendToRenderer('update-status', 'Gemini Call Error: ' + error.message);
+  } catch (err) {
+    console.error('[Gemini Flash] Error:', err.message);
+    sendToRenderer('update-status', 'Gemini Error: ' + err.message);
   }
 }
 
-// Initialize direct Gemini 2.5 Flash Live Websocket connection
+// ─── Dispatch transcription to whichever AI is configured ────────────────────
+function dispatchToAI(transcription, apiKey, groqKey) {
+  if (!transcription.trim()) return;
+  sendToRenderer('append-transcript-text', transcription.trim());
+  sendToRenderer('update-status', 'Thinking...');
+  if (groqKey && groqKey.trim()) {
+    sendToGroq(transcription, groqKey);
+  } else {
+    sendToGeminiFlash(transcription, apiKey);
+  }
+}
+
+// ─── Gemini Live session ──────────────────────────────────────────────────────
 async function initializeGeminiSession(apiKey, groqKey, customPrompt, profile, language) {
   if (isInitializing) return false;
   isInitializing = true;
 
-  sendToRenderer('update-status', 'Initializing live socket...');
+  // Close any stale session first
+  if (activeSession) {
+    try { await activeSession.close(); } catch (_) {}
+    activeSession = null;
+  }
 
-  const client = new GoogleGenAI({
-    vertexai: false,
-    apiKey: apiKey,
-    httpOptions: { apiVersion: 'v1alpha' }
+  sendToRenderer('update-status', 'Connecting...');
+
+  currentSystemPrompt  = getSystemPrompt(profile, customPrompt);
+  currentTranscription = '';
+  conversationHistory  = [];
+  groqHistory          = [];
+  currentSpeakerState  = 'candidate';
+
+  // On Windows the Gemini Live WebSocket causes continuous chunked-pipe errors (-2).
+  // We skip the Live connection entirely and use Web Speech API + gemini-2.0-flash instead.
+  // Mark session as ready without a real Live connection.
+  activeSession = null;   // no live session needed
+  isInitializing = false;
+  console.log('[Live] Skipping Gemini Live WebSocket — using Web Speech + Flash HTTP mode');
+  sendToRenderer('update-status', 'Listening...');
+  return true;
+}
+
+// ─── Vision (native https) ────────────────────────────────────────────────────
+async function sendImageToGeminiHttp(apiKey, base64JPEG, prompt) {
+  if (!apiKey) return { success: false, error: 'Gemini API Key missing' };
+  try {
+    const { status, body } = await nodeHttpsPost(
+      'generativelanguage.googleapis.com',
+      `/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
+      {},
+      {
+        contents: [{ parts: [
+          { inlineData: { mimeType: 'image/jpeg', data: base64JPEG } },
+          { text: prompt }
+        ]}],
+        systemInstruction: { parts: [{ text: currentSystemPrompt || 'You are an advanced visual assistant.' }] }
+      }
+    );
+    if (status !== 200) return { success: false, error: body?.error?.message || `HTTP ${status}` };
+    const fullText = (body.candidates?.[0]?.content?.parts || []).map(p => p.text || '').join('');
+    if (fullText.trim()) {
+      sendToRenderer('new-response', fullText.trim());
+      conversationHistory.push({ timestamp: Date.now(), transcription: '[Screen Capture]', ai_response: fullText.trim() });
+    }
+    return { success: true, text: fullText };
+  } catch (err) {
+    console.error('[Vision] Error:', err.message);
+    return { success: false, error: err.message };
+  }
+}
+
+// ─── IPC Handlers ─────────────────────────────────────────────────────────────
+function setupGeminiIpcHandlers() {
+
+  ipcMain.on('set-current-speaker', (_, speaker) => {
+    currentSpeakerState = speaker;
+    console.log('[Speaker] Now:', speaker);
   });
 
-  const systemPrompt = getSystemPrompt(profile, customPrompt, true);
-  currentSystemPrompt = systemPrompt;
-
-  // Reset conversation histories
-  currentTranscription = '';
-  conversationHistory = [];
-  groqHistory = [];
-
-  try {
-    const session = await client.live.connect({
-      model: 'gemini-2.5-flash-native-audio-preview-09-2025',
-      callbacks: {
-        onopen: function() {
-          sendToRenderer('update-status', 'Live session connected');
-          console.log('[Gemini Live] Websocket connection open.');
-        },
-        onmessage: function(message) {
-          // Track speech transcription from candidate or interviewer
-          if (message.serverContent?.inputTranscription?.results) {
-            const results = message.serverContent.inputTranscription.results;
-            for (const res of results) {
-              if (res.transcript) {
-                const label = res.speakerId === 1 ? 'Interviewer' : 'Candidate';
-                currentTranscription += `[${label}]: ${res.transcript}\n`;
-              }
-            }
-          } else if (message.serverContent?.inputTranscription?.text) {
-            const text = message.serverContent.inputTranscription.text;
-            if (text.trim()) {
-              currentTranscription += `[Interviewer]: ${text}\n`;
-            }
-          }
-
-          // When the interviewer has finished speaking (turn is complete), trigger faster model
-          if (message.serverContent?.generationComplete) {
-            if (currentTranscription.trim()) {
-              sendToRenderer('append-transcript-text', currentTranscription.trim());
-              
-              if (groqKey && groqKey.trim()) {
-                sendToGroq(currentTranscription, groqKey);
-              } else {
-                sendToGeminiFlash(currentTranscription, apiKey);
-              }
-              currentTranscription = '';
-            }
-          }
-
-          if (message.serverContent?.turnComplete) {
-            sendToRenderer('update-status', 'Listening...');
-          }
-        },
-        onerror: function(err) {
-          console.error('[Gemini Live] Session error:', err.message);
-          sendToRenderer('update-status', 'Live Error: ' + err.message);
-        },
-        onclose: function(e) {
-          console.log('[Gemini Live] Session closed:', e.reason);
-          sendToRenderer('update-status', 'Live Session Offline');
-        }
-      },
-      config: {
-        responseModalities: [Modality.AUDIO],
-        proactivity: { proactiveAudio: true },
-        outputAudioTranscription: {},
-        tools: [{ googleSearch: {} }],
-        inputAudioTranscription: {
-          enableSpeakerDiarization: true,
-          minSpeakerCount: 2,
-          maxSpeakerCount: 2
-        },
-        speechConfig: { languageCode: language },
-        systemInstruction: {
-          parts: [{ text: systemPrompt }]
-        }
-      }
-    });
-
-    activeSession = session;
-    isInitializing = false;
-    return true;
-  } catch (error) {
-    console.error('[Gemini Live] Direct initialization failed:', error);
-    isInitializing = false;
-    sendToRenderer('update-status', 'Connection Failed');
-    return false;
-  }
-}
-
-// Vision screen capture analyzer
-async function sendImageToGeminiHttp(apiKey, base64JPEG, prompt) {
-  if (!apiKey) {
-    return { success: false, error: 'Gemini API Key missing' };
-  }
-
-  console.log('[Gemini Vision] Analyzing screen frame using gemini-2.5-flash...');
-
-  try {
-    const ai = new GoogleGenAI({ apiKey });
-    
-    const contents = [
-      {
-        inlineData: {
-          mimeType: 'image/jpeg',
-          data: base64JPEG
-        }
-      },
-      { text: prompt }
-    ];
-
-    const responseStream = await ai.models.generateContentStream({
-      model: 'gemini-2.5-flash',
-      contents: contents,
-      config: {
-        systemInstruction: { parts: [{ text: currentSystemPrompt || 'You are an advanced screen solving visual assistant.' }] }
-      }
-    });
-
-    let fullText = '';
-    let isFirst = true;
-
-    for await (const chunk of responseStream) {
-      const chunkText = chunk.text;
-      if (chunkText) {
-        fullText += chunkText;
-        sendToRenderer(isFirst ? 'new-response' : 'update-response', fullText);
-        isFirst = false;
-      }
-    }
-
-    // Save vision turn
-    conversationHistory.push({
-      timestamp: Date.now(),
-      transcription: '[Analyze Screen Captured]',
-      ai_response: fullText.trim()
-    });
-
-    return { success: true, text: fullText };
-  } catch (error) {
-    console.error('[Gemini Vision] Image analysis failed:', error);
-    return { success: false, error: error.message };
-  }
-}
-
-function setupGeminiIpcHandlers() {
-  // Start Standalone BYOK session
-  ipcMain.handle('initialize-standalone-byok', async (event, { apiKey, groqKey, customPrompt, profile, language }) => {
+  ipcMain.handle('initialize-standalone-byok', async (_, { apiKey, groqKey, customPrompt, profile, language }) => {
     try {
       const success = await initializeGeminiSession(apiKey, groqKey, customPrompt, profile, language);
       return { success };
-    } catch (error) {
-      console.error('[IPC] Init standalone failed:', error);
-      return { success: false, error: error.message };
+    } catch (err) {
+      return { success: false, error: err.message };
     }
   });
 
-  // Stream raw pcm audio buffers into the Gemini Live Session
-  ipcMain.handle('send-pcm-audio-chunk', async (event, base64PCM) => {
-    if (!activeSession) return { success: false, error: 'No active Live session' };
-    try {
-      await activeSession.sendRealtimeInput({
-        audio: {
-          data: base64PCM,
-          mimeType: 'audio/pcm;rate=24000'
-        }
-      });
-      return { success: true };
-    } catch (error) {
-      console.error('[IPC] Send audio error:', error);
-      return { success: false, error: error.message };
-    }
+  // PCM chunks not used — Web Speech API handles transcription
+  ipcMain.handle('send-pcm-audio-chunk', async () => {
+    return { success: true };
   });
 
-  // Process Vision Screen Analysis
-  ipcMain.handle('send-image-to-gemini-http', async (event, { apiKey, base64JPEG, prompt }) => {
-    try {
-      const result = await sendImageToGeminiHttp(apiKey, base64JPEG, prompt);
-      return result;
-    } catch (error) {
-      console.error('[IPC] Vision request error:', error);
-      return { success: false, error: error.message };
-    }
+  ipcMain.handle('send-image-to-gemini-http', async (_, { apiKey, base64JPEG, prompt }) => {
+    try { return await sendImageToGeminiHttp(apiKey, base64JPEG, prompt); }
+    catch (err) { return { success: false, error: err.message }; }
   });
 
-  // Direct manual text input
-  ipcMain.handle('send-text-to-gemini-http', async (event, { apiKey, groqKey, text }) => {
-    if (!text || text.trim() === '') return { success: false, error: 'Empty text' };
+  ipcMain.handle('transcribe-audio-chunk', async (_, { base64Audio, mimeType, groqKey, apiKey }) => {
+    if (!groqKey) {
+      console.warn('[Whisper] No Groq key — skipping transcription');
+      return { success: false, error: 'No Groq key' };
+    }
     try {
-      if (groqKey && groqKey.trim()) {
-        await sendToGroq(text, groqKey);
-      } else {
-        await sendToGeminiFlash(text, apiKey);
+      const audioBuffer = Buffer.from(base64Audio, 'base64');
+      console.log('[Whisper] Transcribing', audioBuffer.length, 'bytes via Groq Whisper...');
+      const { status, body } = await transcribeWithGroqWhisper(audioBuffer, groqKey);
+      if (status !== 200) {
+        const msg = body?.error?.message || JSON.stringify(body);
+        console.error('[Whisper] API error:', status, msg);
+        return { success: false, error: msg };
       }
-      return { success: true };
-    } catch (error) {
-      console.error('[IPC] Text generation error:', error);
-      return { success: false, error: error.message };
+      const rawText = body?.text?.trim() || '';
+      // Filter common Whisper hallucinations on silence/noise
+      const HALLUCINATIONS = [
+        /^(thank you\.?|thanks\.?|hello\.?|bye\.?|goodbye\.?|okay\.?|ok\.?|um+\.?|uh+\.?|hmm+\.?|mm+\.?)$/i,
+        /^(hello everyone[,.]?|welcome to my channel[.!]?|subscribe[.!]?)$/i,
+        /^[^\x00-\x7F]{1,6}$/,  // pure non-ASCII (foreign hallucination)
+      ];
+      const isHallucination = rawText.length < 3 ||
+        HALLUCINATIONS.some(re => re.test(rawText));
+      const text = isHallucination ? '' : rawText;
+      if (isHallucination) {
+        console.log('[Whisper] Filtered hallucination:', rawText);
+      } else {
+        console.log('[Whisper] Transcript:', text);
+      }
+      return { success: true, text };
+    } catch (err) {
+      console.error('[Whisper] Error:', err.message);
+      return { success: false, error: err.message };
     }
   });
 
-  // Close direct standalone sessions
+  ipcMain.handle('send-text-to-gemini-http', async (_, { apiKey, groqKey, text }) => {
+    if (!text?.trim()) return { success: false, error: 'Empty text' };
+    try {
+      // Tag with the current speaker so transcript bubbles render correctly
+      const speaker = currentSpeakerState === 'interviewer' ? 'Interviewer' : 'Candidate';
+      const tagged  = `[${speaker}]: ${text.trim()}`;
+      // dispatchToAI shows the transcript bubble AND triggers the AI pipeline
+      dispatchToAI(tagged, apiKey, groqKey);
+      return { success: true };
+    } catch (err) {
+      return { success: false, error: err.message };
+    }
+  });
+
   ipcMain.handle('close-standalone-session', async () => {
     try {
       if (activeSession) {
@@ -406,17 +369,14 @@ function setupGeminiIpcHandlers() {
         activeSession = null;
       }
       currentTranscription = '';
-      conversationHistory = [];
-      groqHistory = [];
+      conversationHistory  = [];
+      groqHistory          = [];
       sendToRenderer('update-status', 'Disconnected');
       return { success: true };
-    } catch (error) {
-      console.error('[IPC] Close session error:', error);
-      return { success: false, error: error.message };
+    } catch (err) {
+      return { success: false, error: err.message };
     }
   });
 }
 
-module.exports = {
-  setupGeminiIpcHandlers
-};
+module.exports = { setupGeminiIpcHandlers };
